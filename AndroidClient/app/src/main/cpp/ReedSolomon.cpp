@@ -98,7 +98,7 @@ namespace RS {
     }
 
     // =========================================================
-    // 模块三：RS(64, 32) 编解码器实现
+    // 模块三：RS 编解码器实现
     // =========================================================
     ReedSolomonCodec::ReedSolomonCodec(int n_val, int k_val) : n(n_val), k(k_val) {
         t = (n - k) / 2;
@@ -170,7 +170,7 @@ namespace RS {
                 C = T;
             }
         }
-        C.Trim(); // 【修复 2】：确保错误定位多项式修剪干净，防止返回错误阶数
+        C.Trim();
         return C;
     }
 
@@ -203,12 +203,13 @@ namespace RS {
         Polynomial err_locator_deriv = Derivative(err_locator);
         
         Bytes corrected = received.coef; 
-        while(corrected.size() < 64) corrected.push_back(0);
+        
+        // 🔥 核心修复：把之前写死的 64 改为动态类成员 n，彻底拆除地雷！
+        while(corrected.size() < n) corrected.push_back(0); 
 
         for (int pos : err_pos) {
             uint8_t x_inv = gf.Inv(gf.Power(2, pos));
             
-            // 【修复 1：核心数学 Bug】：删除了错误的 gf.Mul(gf.Power(2,pos))，分子仅仅是 Omega(x_inv)
             uint8_t num = omega.Evaluate(x_inv, gf);
             uint8_t den = err_locator_deriv.Evaluate(x_inv, gf);
             
@@ -237,9 +238,9 @@ namespace RS {
                 return Bytes();
             }
 
-            // 【修复 3：拦截缩短码的幽灵越界】：如果幻觉错误点超出 64 字节（虚拟零区），立刻拦截！
+            // 🔥 核心修复：把界限卡死在真正的 n 处，拦截幽灵错误
             for (int pos : err_pos) {
-                if (pos >= n) { // n = 64
+                if (pos >= n) { 
                     uncorrectable = true;
                     return Bytes();
                 }

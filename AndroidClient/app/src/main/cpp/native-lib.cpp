@@ -5,8 +5,10 @@
 #include <memory>
 #include <openssl/evp.h>
 #include <fstream>
+#include <random>
 #include "json.hpp"
 #include "User.h"
+#include <functional>
 #include "BioModule.h"
 #include <android/log.h>
 #define LOG_TAG "IoT_Auth_Native"
@@ -18,6 +20,16 @@ std::string g_currentUid = "";
 
 using json = nlohmann::json;
 
+// =========================================================
+// 【新增】：UID 虚拟映射引擎
+// 将任意字符串 UID 稳定映射到 FVC2002 物理库的 101~110 之间
+// =========================================================
+std::string MapUidToFvcId(const std::string& uid) {
+    if (uid.empty()) return "101"; // 兜底保护
+    size_t hash_val = std::hash<std::string>{}(uid);
+    int fvc_id = 101 + (hash_val % 10);
+    return std::to_string(fvc_id);
+}
 // 修改 native-lib.cpp 中的解码函数
 std::vector<uint8_t> Base64Decode(const std::string& input) {
     if (input.empty()) return {};
@@ -115,7 +127,6 @@ Java_com_filo_iotauth_MainActivity_initDevice(JNIEnv* env, jobject /* this */, j
 // ---------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_filo_iotauth_MainActivity_generateRegisterPayload(JNIEnv* env, jobject /* this */, jstring pwd_) {
-    // ... 此处正常使用 BytesToHex 函数 ...
     if (!g_device) return env->NewStringUTF("{\"error\": \"Device not initialized\"}");
 
     const char* pwd = env->GetStringUTFChars(pwd_, 0);
@@ -123,19 +134,28 @@ Java_com_filo_iotauth_MainActivity_generateRegisterPayload(JNIEnv* env, jobject 
     env->ReleaseStringUTFChars(pwd_, pwd);
 
     try {
-        // 获取模拟硬件指纹特征
-        BioModule::Bytes mockBio = BioModule::GenerateMockBiometric(64);
-        // ================= 【新增：物理保存基准指纹】 =================
-        std::string bio_file = g_storagePath + "mock_bio.dat";
-        std::ofstream bioOut(bio_file, std::ios::binary);
-        if (bioOut.is_open()) {
-            bioOut.write(reinterpret_cast<const char*>(mockBio.data()), mockBio.size());
-            bioOut.close();
-        }
-        // 调用状态机生成注册包
-        ProtocolMessages::RegistrationRequest req = g_device->GenerateRegistrationRequest(password, mockBio);
+        // ================= 【核心替换：读取真实的物理基准特征】 =================
+        // 目标文件格式：存储路径/fingerprint_features/101_1_vault.dat
+        // 将用户的真实 UID 映射为底层物理指纹 ID
+        std::string mappedFvcId = MapUidToFvcId(g_currentUid);
+        std::string bio_file = g_storagePath + "fingerprint_features/" + mappedFvcId + "_1_vault.dat";
+        std::ifstream bioIn(bio_file, std::ios::binary);
 
-        // 序列化为 JSON 字符串
+        if (!bioIn.is_open()) {
+            std::string err = "{\"error\": \"找不到基准指纹: " + bio_file + "\"}";
+            return env->NewStringUTF(err.c_str());
+        }
+
+        // 神经密码学特征固定为 512个float = 2048 bytes
+        BioModule::Bytes realBio(2048, 0);
+        bioIn.read(reinterpret_cast<char*>(realBio.data()), 2048);
+        bioIn.close();
+        LOGE("✅ 注册阶段：成功加载物理基准指纹 -> %s", bio_file.c_str());
+
+        // 调用状态机生成注册包 (此时传入的是真实 2048 字节特征)
+        ProtocolMessages::RegistrationRequest req = g_device->GenerateRegistrationRequest(password, realBio);
+
+        // ... 下面的序列化 JSON 逻辑保持不变 ...
         std::string regJson = "{\n"
                               "  \"uid\": \"" + req.uid + "\",\n"
                                                           "  \"avk_pkSig\": \"" + BytesToHex(req.avk_pkSig) + "\",\n"
@@ -307,21 +327,35 @@ Java_com_filo_iotauth_MainActivity_processAuthChallenge(
         challenge.dhpubS = Base64Decode(dhpubSStr);
         challenge.serversigm = Base64Decode(serverSigStr);
 
-        std::string bio_file = g_storagePath + "mock_bio.dat";
-        std::ifstream bioIn(bio_file, std::ios::binary);
-        BioModule::Bytes originalBio(64, 0);
+        // ================= 【核心替换：随机抽取带噪声的物理探针特征】 =================
+        BioModule::Bytes currentBio(2048, 0);
 
-        if (bioIn.is_open()) {
-            bioIn.read(reinterpret_cast<char*>(originalBio.data()), 64);
-            bioIn.close();
+        if (is_bio_success) {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> distrib(2, 7);
+            int probeIndex = distrib(gen);
+
+            // 获取映射后的物理 ID
+            std::string mappedFvcId = MapUidToFvcId(g_currentUid);
+            std::string bio_file = g_storagePath + "fingerprint_features/" + mappedFvcId + "_" + std::to_string(probeIndex) + "_vault.dat";
+            std::ifstream bioIn(bio_file, std::ios::binary);
+
+            if (bioIn.is_open()) {
+                bioIn.read(reinterpret_cast<char*>(currentBio.data()), 2048);
+                bioIn.close();
+                LOGE("✅ 认证阶段：成功加载物理探针 -> %s (Mapped from %s)", bio_file.c_str(), g_currentUid.c_str());
+            } else {
+                return env->NewStringUTF("{\"error\": \"找不到探针指纹，请确认Assets释放成功。\"}");
+            }
         } else {
-            return env->NewStringUTF("{\"error\": \"Bio template not found. Please register first.\"}");
+            // 🚨 TEE 验证失败！或者用户点击了“取消/模拟验证失败”
+            // 直接生成纯随机的 2048 字节垃圾数据，假装是黑客强行按压！
+            LOGE("💀 触发防御：指纹错配，直接喂给模糊提取器纯垃圾数据！");
+            currentBio = BioModule::GenerateMockBiometric(2048);
         }
 
-        int noiseLevel = is_bio_success ? 12 : 200;
-        CryptoModule::Bytes currentBio = BioModule::AddNoise(originalBio, noiseLevel);
-
-        // 这里进入 User.cpp，由于加了 #ifndef __ANDROID__，它会自动跳过 C++ 的验签
+        // 核心解密与 Hash 生成
         ProtocolMessages::AuthResponse resp = g_device->ProcessAuthChallenge(challenge, pwdStr, currentBio);
 
         json resultJson;

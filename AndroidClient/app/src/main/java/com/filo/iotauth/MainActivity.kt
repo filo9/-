@@ -20,6 +20,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.Executor
+import java.io.File
+import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -60,7 +62,7 @@ class MainActivity : AppCompatActivity() {
     private var webSocket: WebSocket? = null
 
     // 请确保这里的 IP 是你宿主机的局域网 IP
-    private val SERVER_IP = "192.168.1.100"
+    private val SERVER_IP = "192.168.1.104"
     private val HTTP_REGISTER_URL = "http://$SERVER_IP:8081/api/register"
     private val WS_AUTH_URL = "ws://$SERVER_IP:8081/ws/auth"
 
@@ -104,6 +106,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        copyAssetsToInternalStorage()
         // 1. 绑定 UI 控件到全局变量
         etUid = findViewById(R.id.etUid)
         etPassword = findViewById(R.id.etPassword)
@@ -256,6 +259,29 @@ class MainActivity : AppCompatActivity() {
 
             // 顺便更新一下按钮文字，让用户知道当前处于什么模式
             btnAcMode.text = if (acMode == "cool") "❄️ 切至制热" else "☀️ 切至制冷"
+        }
+    }
+
+    private fun copyAssetsToInternalStorage() {
+        val destFolder = File(filesDir, "fingerprint_features")
+        if (!destFolder.exists()) destFolder.mkdirs()
+
+        try {
+            val files = assets.list("fingerprint_features") ?: return
+            for (filename in files) {
+                val destFile = File(destFolder, filename)
+                // 只有文件不存在时才拷贝，节省开机时间
+                if (!destFile.exists()) {
+                    assets.open("fingerprint_features/$filename").use { inStream ->
+                        FileOutputStream(destFile).use { outStream ->
+                            inStream.copyTo(outStream)
+                        }
+                    }
+                }
+            }
+            println("======> 物理指纹特征库释放成功！ <======")
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
